@@ -193,6 +193,10 @@ struct qec_state {
 	int last_apply_epoch;
 	// one-shot analog null state (all codes LOGICAL: the wire rfic_dc domain, +-126)
 	int null_armed, null_iters, null_frozen;
+	int rig_passive;		// 0 = unknown (no adc-0 dgb registered yet), 1 = active dgb,
+					// -1 = passive dgb (degenerate gain range): QEC fully disabled -
+					// the quadrature model does not describe a passive rig's independent
+					// I/Q inputs, so estimator pushes would rewrite the stream wrongly
 	s64 null_floor;			// dominant |mean| the last arm proved achievable: the drift
 					// alarm re-arms only past floor + dc_renull_counts, else an
 					// out-of-authority residual re-arms every solve forever
@@ -616,7 +620,13 @@ out:
 	memset(a, 0, sizeof(*a));
 }
 
-// find the RX channel the null can act on: adc 0 (the only lane the ring reader parses)
+// find the RX channel the null can act on: adc 0 (the only lane the ring reader parses).
+// -ENODEV = no daughterboard registered yet (retry later); -EOPNOTSUPP = adc 0 belongs to
+// a passive daughterboard (degenerate gain range - the fleet convention for "no analog
+// controls", see lrx_probe/spectrumd). On those boards rfnm_rx_ch_set is a stub, so
+// rfnm_dgb_rx_set_dc lands nowhere and the null can never converge: it re-arms, escalates
+// to the 2x2 stage and walks forever with zero effect on the stream (observed on Breakout,
+// 2026-08-14). The caller must freeze the null instead of retrying.
 static int qec_find_target(struct qec_state *st) {
 	int i, q;
 
@@ -627,6 +637,9 @@ static int qec_find_target(struct qec_state *st) {
 		}
 		for(q = 0; q < dgb_dt->rx_ch_cnt; q++) {
 			if(dgb_dt->rx_ch[q] && dgb_dt->rx_ch[q]->adc_id == 0) {
+				if(dgb_dt->rx_ch[q]->gain_range.min == dgb_dt->rx_ch[q]->gain_range.max) {
+					return -EOPNOTSUPP;
+				}
 				st->dgb_id = i;
 				st->ch_id = q;
 				return 0;
@@ -828,7 +841,14 @@ static void qec_dc_null_step(struct qec_state *st) {
 		st->null_floor = dom;
 		goto out;
 	}
-	if(qec_find_target(st)) {
+	switch(qec_find_target(st)) {
+	case 0:
+		break;
+	case -EOPNOTSUPP:
+		st->null_frozen = 1;	// passive dgb: same terminal state as a failed DC write
+		st->null_armed = 0;
+		goto out;
+	default:
 		goto out;	// no dgb yet: stay armed, retry on the next window
 	}
 
@@ -864,6 +884,27 @@ static void qec_poll(struct qec_state *st) {
 		if (rfnm_local_rx_fmt != 0 /* RFNM_PACKET_FMT_PACKED12 */ || !rfnm_stream_is_native_rx()) {
 			return;
 		}
+	}
+
+	// A passive daughterboard (degenerate gain range - the fleet convention for "no
+	// analog controls", e.g. Breakout) is not a quadrature front end: its I/Q are
+	// independent ADC inputs, the imbalance model does not apply, and corrector pushes
+	// would rewrite the stream against a fiction. Disable QEC entirely on such a rig
+	// (the corrector stays at the identity written on load). Resolved lazily and cached:
+	// daughterboards register after insmod but never change afterwards.
+	if (st->rig_passive == 0) {
+		int r = qec_find_target(st);
+
+		if (r == -EOPNOTSUPP) {
+			st->rig_passive = -1;
+			st->null_frozen = 1;
+			printk("rfnm_qec: passive daughterboard on adc 0 - QEC disabled on this rig\n");
+		} else if (r == 0) {
+			st->rig_passive = 1;
+		}				// -ENODEV: no dgb yet, stay unknown and re-check
+	}
+	if (st->rig_passive < 0) {
+		return;
 	}
 
 	{
